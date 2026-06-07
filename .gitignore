@@ -1,0 +1,15 @@
+# never commit live data or DB snapshots
+*.db
+*.db-wal
+*.db-shm
+
+# syncthing internals
+.stfolder/
+.stversions/
+.stignore
+
+# backups / scratch / OS
+*.bak
+*.tmp
+*.tmp.*
+.DS_Store

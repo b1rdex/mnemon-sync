@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+#
+# mnemon-sync — code-free sync of mnemon stores across devices via SQLite snapshots.
+#
+# Live DBs stay local (~/.mnemon/data/<store>/mnemon.db). Each device publishes a
+# consistent snapshot to a shared (Syncthing) folder as <store>/<host>.db, and
+# merges peers' snapshots into its own live DB using last-writer-wins on the
+# insights table. Edges are unioned; embeddings ride inside the insight rows.
+#
+# Requires: sqlite3 (merge/snapshot), python3 (install-hooks only).
+# Design: see DESIGN.md
+#
+set -eo pipefail
+shopt -s nullglob
+
+MNEMON_HOME="${MNEMON_DATA_DIR:-$HOME/.mnemon}"
+DATA_DIR="${MNEMON_HOME}/data"
+SYNC_DIR="${MNEMON_SYNC_DIR:-${MNEMON_HOME}/sync}"
+
+# Device id (snapshot filename). Override with MNEMON_SYNC_HOST (also used by tests).
+HOST="${MNEMON_SYNC_HOST:-$(hostname -s 2>/dev/null || hostname)}"
+HOST="$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9_.-' '_')"
+
+# Absolute path to this script (for install-hooks → the hook command).
+SELF="$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)/$(basename "$0")"
+
+# Explicit insight column list — naming columns (not SELECT *) guards against
+# schema drift between fork versions on the two machines.
+INSIGHT_COLS="id, content, category, importance, tags, entities, source, access_count, created_at, updated_at, deleted_at, last_accessed_at, embedding, effective_importance"
+INSIGHT_UPSERT="content=excluded.content, category=excluded.category, importance=excluded.importance, tags=excluded.tags, entities=excluded.entities, source=excluded.source, access_count=excluded.access_count, created_at=excluded.created_at, updated_at=excluded.updated_at, deleted_at=excluded.deleted_at, last_accessed_at=excluded.last_accessed_at, embedding=excluded.embedding, effective_importance=excluded.effective_importance"
+
+log()  { printf '[mnemon-sync] %s\n' "$*" >&2; }
+die()  { printf '[mnemon-sync] ERROR: %s\n' "$*" >&2; exit 1; }
+need_sqlite() { command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 not found (macOS: built-in; Ubuntu: apt install sqlite3)"; }
+
+# merge_one <live.db> <peer.db> — LWW merge of peer into live. Atomic per peer.
+merge_one() {
+  local live="$1" peer="$2"
+  sqlite3 -bail "$live" <<SQL
+PRAGMA busy_timeout=5000;
+PRAGMA foreign_keys=ON;
+ATTACH DATABASE '${peer}' AS peer;
+BEGIN IMMEDIATE;
+-- 1) insights: last-writer-wins by updated_at (RFC3339 UTC text → lexical compare = chronological)
+INSERT INTO insights (${INSIGHT_COLS})
+  SELECT ${INSIGHT_COLS} FROM peer.insights WHERE true
+  ON CONFLICT(id) DO UPDATE SET ${INSIGHT_UPSERT}
+  WHERE excluded.updated_at > insights.updated_at;
+-- 2) edges: union (endpoints guaranteed to exist after step 1)
+INSERT OR IGNORE INTO edges (source_id, target_id, edge_type, weight, metadata, created_at)
+  SELECT source_id, target_id, edge_type, weight, metadata, created_at FROM peer.edges;
+-- 3) drop edges touching soft-deleted insights (mirrors mnemon's own forget())
+DELETE FROM edges
+  WHERE source_id IN (SELECT id FROM insights WHERE deleted_at IS NOT NULL)
+     OR target_id IN (SELECT id FROM insights WHERE deleted_at IS NOT NULL);
+COMMIT;
+DETACH DATABASE peer;
+SQL
+}
+
+cmd_export() {
+  need_sqlite
+  [ -d "$DATA_DIR" ] || { log "no data dir ($DATA_DIR); nothing to export"; return 0; }
+  local n=0 store live dest_dir dest tmp
+  for store_path in "$DATA_DIR"/*/; do
+    store="$(basename "$store_path")"
+    live="${store_path}mnemon.db"
+    [ -f "$live" ] || continue
+    dest_dir="$SYNC_DIR/$store"
+    dest="$dest_dir/$HOST.db"
+    mkdir -p "$dest_dir"
+    # mtime guard: skip if live DB hasn't changed since the last snapshot
+    if [ -f "$dest" ] && [ ! "$live" -nt "$dest" ]; then
+      log "export: $store unchanged, skip"
+      continue
+    fi
+    tmp="$dest.tmp.$$"
+    rm -f "$tmp"
+    if ! sqlite3 -bail "$live" "VACUUM INTO '${tmp}'"; then
+      log "export: FAILED to snapshot $store (skipped)"
+      rm -f "$tmp"
+      continue
+    fi
+    mv -f "$tmp" "$dest"   # atomic publish — Syncthing never sees a partial file
+    log "export: $store -> $dest"
+    n=$((n + 1))
+  done
+  log "export: $n store(s) snapshotted as '$HOST'"
+}
+
+cmd_import() {
+  need_sqlite
+  [ -d "$SYNC_DIR" ] || { log "no sync dir ($SYNC_DIR); nothing to import"; return 0; }
+  local merged=0 store live_dir live first
+  for store_path in "$SYNC_DIR"/*/; do
+    store="$(basename "$store_path")"
+    local snaps=( "${store_path}"*.db )
+    [ ${#snaps[@]} -gt 0 ] || continue   # not a store folder (e.g. bin/) — skip
+    live_dir="$DATA_DIR/$store"
+    live="$live_dir/mnemon.db"
+    # bootstrap: a store created on a peer appears here automatically
+    if [ ! -f "$live" ]; then
+      first=""
+      for s in "${snaps[@]}"; do
+        [ "$(basename "$s")" = "$HOST.db" ] && continue
+        first="$s"; break
+      done
+      if [ -n "$first" ]; then
+        mkdir -p "$live_dir"
+        cp "$first" "$live"
+        log "import: bootstrapped store '$store' from $(basename "$first")"
+      fi
+    fi
+    [ -f "$live" ] || continue
+    for peer in "${snaps[@]}"; do
+      [ "$(basename "$peer")" = "$HOST.db" ] && continue   # never merge our own snapshot
+      if merge_one "$live" "$peer"; then
+        log "import: merged $(basename "$peer") -> $store"
+        merged=$((merged + 1))
+      else
+        log "import: FAILED to merge $(basename "$peer") into $store (skipped)"
+      fi
+    done
+  done
+  log "import: $merged peer snapshot(s) merged"
+}
+
+cmd_status() {
+  need_sqlite
+  log "host=$HOST  data=$DATA_DIR  sync=$SYNC_DIR"
+  local store live
+  for store_path in "$DATA_DIR"/*/; do
+    store="$(basename "$store_path")"
+    live="${store_path}mnemon.db"
+    [ -f "$live" ] || continue
+    local active deleted edges
+    active=$(sqlite3 "$live" "SELECT count(*) FROM insights WHERE deleted_at IS NULL;" 2>/dev/null || echo '?')
+    deleted=$(sqlite3 "$live" "SELECT count(*) FROM insights WHERE deleted_at IS NOT NULL;" 2>/dev/null || echo '?')
+    edges=$(sqlite3 "$live" "SELECT count(*) FROM edges;" 2>/dev/null || echo '?')
+    printf '  %-16s %s active / %s deleted / %s edges\n' "$store" "$active" "$deleted" "$edges" >&2
+    if [ -d "$SYNC_DIR/$store" ]; then
+      local snap
+      for snap in "$SYNC_DIR/$store"/*.db; do
+        [ -e "$snap" ] || continue
+        printf '       snapshot: %s\n' "$(basename "$snap")" >&2
+      done
+    fi
+  done
+}
+
+cmd_hooks() {
+  local action="$1"
+  local settings="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
+  command -v python3 >/dev/null 2>&1 || die "python3 not found (needed for $action-hooks)"
+  MNS_ACTION="$action" MNS_SETTINGS="$settings" MNS_SCRIPT="$SELF" python3 - <<'PY'
+import json, os, datetime
+
+action = os.environ["MNS_ACTION"]
+path   = os.environ["MNS_SETTINGS"]
+script = os.environ["MNS_SCRIPT"]
+
+# event -> (subcommand, placement)
+PLAN = [("SessionStart", "import", "prepend"),
+        ("Stop",         "export", "append"),
+        ("SubagentStop", "export", "append")]
+
+data = {}
+if os.path.exists(path):
+    with open(path) as f:
+        data = json.load(f)
+hooks = data.setdefault("hooks", {})
+
+def group(sub):
+    return {"hooks": [{"type": "command", "command": "%s %s >/dev/null 2>&1 || true" % (script, sub)}]}
+
+def event_has_ours(event):
+    for g in hooks.get(event, []):
+        for h in g.get("hooks", []):
+            if isinstance(h, dict) and script in str(h.get("command", "")):
+                return True
+    return False
+
+changed = []
+if action == "install":
+    for event, sub, where in PLAN:
+        if event_has_ours(event):
+            continue
+        arr = hooks.setdefault(event, [])
+        (arr.insert(0, group(sub)) if where == "prepend" else arr.append(group(sub)))
+        changed.append("%s: + %s" % (event, sub))
+elif action == "uninstall":
+    for event in list(hooks.keys()):
+        kept_groups = []
+        removed = False
+        for g in hooks[event]:
+            hs = g.get("hooks", [])
+            keep = [h for h in hs if not (isinstance(h, dict) and script in str(h.get("command", "")))]
+            if len(keep) != len(hs):
+                removed = True
+            if keep:
+                ng = dict(g); ng["hooks"] = keep; kept_groups.append(ng)
+        if removed:
+            changed.append("%s: removed our hook(s)" % event)
+        if kept_groups:
+            hooks[event] = kept_groups
+        else:
+            del hooks[event]
+else:
+    raise SystemExit("unknown hooks action: %s" % action)
+
+if not changed:
+    print("[mnemon-sync] hooks already up to date; no change")
+else:
+    if os.path.exists(path):
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        bak = "%s.mnemon-sync.%s.bak" % (path, ts)
+        with open(path) as f, open(bak, "w") as g:
+            g.write(f.read())
+        print("[mnemon-sync] backed up settings -> %s" % bak)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    print("[mnemon-sync] hooks %sed:" % action)
+    for c in changed:
+        print("   " + c)
+PY
+}
+
+usage() {
+  cat >&2 <<EOF
+mnemon-sync — sync mnemon stores across devices via SQLite snapshots + Syncthing
+
+usage: mnemon-sync <command>
+
+commands:
+  export            snapshot each live store to \$SYNC_DIR/<store>/<host>.db
+  import            merge peers' snapshots into each live store (LWW)
+  sync              export then import
+  status            show per-store counts and known snapshots
+  install-hooks     add import(SessionStart) + export(Stop,SubagentStop) to Claude settings.json
+  uninstall-hooks   remove the hooks added by install-hooks
+  help              this message
+
+env:
+  MNEMON_DATA_DIR   mnemon home (default ~/.mnemon)
+  MNEMON_SYNC_DIR   shared snapshot folder (default \$MNEMON_DATA_DIR/sync)
+  MNEMON_SYNC_HOST  device id for snapshot filename (default: hostname -s)
+  CLAUDE_SETTINGS   path to Claude settings.json (default ~/.claude/settings.json)
+EOF
+}
+
+case "${1:-help}" in
+  export)          cmd_export ;;
+  import)          cmd_import ;;
+  sync)            cmd_export; cmd_import ;;
+  status)          cmd_status ;;
+  install-hooks)   cmd_hooks install ;;
+  uninstall-hooks) cmd_hooks uninstall ;;
+  help|-h|--help)  usage ;;
+  *)               log "unknown command: $1"; usage; exit 1 ;;
+esac
