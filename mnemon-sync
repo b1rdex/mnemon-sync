@@ -25,7 +25,7 @@ HOST="$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9_.-' '_')"
 SELF="$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)/$(basename "$0")"
 
 # Explicit insight column list — naming columns (not SELECT *) guards against
-# schema drift between fork versions on the two machines.
+# schema drift between mnemon versions on the two machines.
 INSIGHT_COLS="id, content, category, importance, tags, entities, source, access_count, created_at, updated_at, deleted_at, last_accessed_at, embedding, effective_importance"
 INSIGHT_UPSERT="content=excluded.content, category=excluded.category, importance=excluded.importance, tags=excluded.tags, entities=excluded.entities, source=excluded.source, access_count=excluded.access_count, created_at=excluded.created_at, updated_at=excluded.updated_at, deleted_at=excluded.deleted_at, last_accessed_at=excluded.last_accessed_at, embedding=excluded.embedding, effective_importance=excluded.effective_importance"
 

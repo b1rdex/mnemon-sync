@@ -14,10 +14,9 @@ copies, and — most importantly — Syncthing cannot merge a binary file, so tw
 machines writing produces `.sync-conflict` files and silent data loss. So we
 sync a **per-device snapshot** and merge **logically**.
 
-**Hard constraint — zero mnemon Go code.** This is meant for people who run a fork
-of mnemon and want to keep pulling upstream without merge burden. Everything here
-is external: the system `sqlite3` CLI, shell, `python3`, Syncthing, and Claude Code
-hook config.
+**Hard constraint — zero changes to mnemon.** Everything here is external: the
+system `sqlite3` CLI, shell, `python3`, Syncthing, and Claude Code hook config. It
+works with a stock, upstream mnemon install — nothing to patch or rebuild.
 
 ## 2. Key decisions
 
