@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # weekly: re-test against the latest released mnemon to catch upstream schema drift
+    - cron: '0 6 * * 1'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash syntax check
+        run: |
+          bash -n mnemon-sync
+          bash -n mnemon-sync.test.sh
+      - name: shellcheck
+        run: shellcheck -S warning mnemon-sync mnemon-sync.test.sh
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install real upstream mnemon
+        run: |
+          go install github.com/mnemon-dev/mnemon@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Ensure sqlite3 (Linux)
+        if: runner.os == 'Linux'
+        run: command -v sqlite3 || (sudo apt-get update && sudo apt-get install -y sqlite3)
+
+      - name: Create seed store with the real binary
+        run: |
+          export MNEMON_DATA_DIR="$RUNNER_TEMP/mnemon-home"
+          mnemon remember "CI seed insight written by the real mnemon binary"
+          echo "MNEMON_SEED=$MNEMON_DATA_DIR/data/default/mnemon.db" >> "$GITHUB_ENV"
+
+      - name: Run test harness
+        run: bash mnemon-sync.test.sh
