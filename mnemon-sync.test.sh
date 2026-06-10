@@ -155,6 +155,47 @@ runD import; runE import
 [ "$(sqlite3 "$E/data/default/mnemon.db" "SELECT effective_importance FROM insights WHERE id='DD-old';")" = "0.5" ] || fail "drift: missing column did not get its default on the full-schema device"
 ok "rows sync across devices with different column sets (common columns merged, defaults fill the rest)"
 
+echo "== assert usage-fields merge: recall bumps travel without an updated_at change =="
+SHARED3="$ROOT/shared-usage"; U1="$ROOT/devU1"; U2="$ROOT/devU2"
+mkdir -p "$SHARED3" "$U1/data/default" "$U2/data/default"
+cp "$SEED" "$U1/data/default/mnemon.db"; cp "$SEED" "$U2/data/default/mnemon.db"
+DBU1="$U1/data/default/mnemon.db"; DBU2="$U2/data/default/mnemon.db"
+runU1() { MNEMON_DATA_DIR="$U1" MNEMON_SYNC_DIR="$SHARED3" MNEMON_SYNC_HOST="hot"  "$SCRIPT" "$@" >/dev/null 2>&1; }
+runU2() { MNEMON_DATA_DIR="$U2" MNEMON_SYNC_DIR="$SHARED3" MNEMON_SYNC_HOST="cold" "$SCRIPT" "$@" >/dev/null 2>&1; }
+for db in "$DBU1" "$DBU2"; do ins "$db" "R1" "recalled a lot" "$BASE"; ins "$db" "R2" "edit vs recall" "$BASE"; ins "$db" "R3" "bumped on both" "$BASE"; done
+
+# (A) the commenter's case: recall on 'hot' bumps access_count + last_accessed_at, NOT updated_at
+sqlite3 "$DBU1" "UPDATE insights SET access_count = 2, last_accessed_at = '$T2' WHERE id='R1';"
+# (B) edit-vs-recall: 'cold' EDITS content (updated_at=LATER); 'hot' merely recalled it (access=5, la=T2, old content)
+sqlite3 "$DBU1" "UPDATE insights SET access_count = 5, last_accessed_at = '$T2' WHERE id='R2';"
+sqlite3 "$DBU2" "UPDATE insights SET content = 'EDITED ON COLD', updated_at = '$LATER' WHERE id='R2';"
+# (C) concurrent bumps on both sides -> max wins (documented undercount)
+sqlite3 "$DBU1" "UPDATE insights SET access_count = 4, last_accessed_at = '$T1' WHERE id='R3';"
+sqlite3 "$DBU2" "UPDATE insights SET access_count = 3, last_accessed_at = '$T2' WHERE id='R3';"
+
+runU1 export; runU2 export
+runU1 import; runU2 import
+
+# (A) bump propagated to the cold device, kept on the hot one
+[ "$(sqlite3 "$DBU2" "SELECT access_count FROM insights WHERE id='R1';")" = 2 ] || fail "usage: R1 access_count did not reach cold device"
+[ "$(sqlite3 "$DBU2" "SELECT last_accessed_at FROM insights WHERE id='R1';")" = "$T2" ] || fail "usage: R1 last_accessed_at did not reach cold device"
+[ "$(sqlite3 "$DBU1" "SELECT access_count FROM insights WHERE id='R1';")" = 2 ] || fail "usage: R1 access_count lost on hot device"
+ok "recall bump (access_count + last_accessed_at) propagates without updated_at changing"
+
+# (B) content edit wins everywhere, usage survives everywhere
+[ "$(sqlite3 "$DBU1" "SELECT content FROM insights WHERE id='R2';")" = "EDITED ON COLD" ] || fail "usage: R2 edit did not reach hot device"
+[ "$(sqlite3 "$DBU2" "SELECT content FROM insights WHERE id='R2';")" = "EDITED ON COLD" ] || fail "usage: R2 edit lost on cold device"
+[ "$(sqlite3 "$DBU1" "SELECT access_count FROM insights WHERE id='R2';")" = 5 ] || fail "usage: R2 access_count clobbered by content win on hot device"
+[ "$(sqlite3 "$DBU2" "SELECT access_count FROM insights WHERE id='R2';")" = 5 ] || fail "usage: R2 access_count did not reach cold device"
+[ "$(sqlite3 "$DBU2" "SELECT last_accessed_at FROM insights WHERE id='R2';")" = "$T2" ] || fail "usage: R2 last_accessed_at did not reach cold device"
+ok "content edit wins by updated_at while usage fields survive via max (both directions)"
+
+# (C) concurrent bumps converge to max on both
+[ "$(sqlite3 "$DBU1" "SELECT access_count FROM insights WHERE id='R3';")" = 4 ] || fail "usage: R3 max not applied on hot device"
+[ "$(sqlite3 "$DBU2" "SELECT access_count FROM insights WHERE id='R3';")" = 4 ] || fail "usage: R3 max not applied on cold device"
+[ "$(sqlite3 "$DBU1" "SELECT last_accessed_at FROM insights WHERE id='R3';")" = "$T2" ] || fail "usage: R3 newest last_accessed_at not applied on hot device"
+ok "concurrent bumps converge to max(access_count) and max(last_accessed_at)"
+
 echo "== assert install-hooks idempotency + non-destructiveness =="
 ST="$ROOT/settings.json"
 cat > "$ST" <<JSON

@@ -62,12 +62,37 @@ merge_one() {
     log "merge: $(basename "$peer") has no usable insights table (need id + updated_at); skipped"
     return 1
   fi
+  # Usage fields are a different kind of data than content: recall bumps them
+  # WITHOUT touching updated_at (mnemon's mtime/atime split), so plain LWW would
+  # drop them. They merge by max() instead — monotone, convergent, and a content
+  # win never clobbers a higher usage signal from the other device.
   for c in $ins_cols; do
     collist="$collist, $c"
-    [ "$c" = "id" ] && continue
-    setlist="$setlist, $c=excluded.$c"
+    case "$c" in
+      id) ;;
+      access_count)
+        setlist="$setlist, access_count = max(coalesce(insights.access_count,0), coalesce(excluded.access_count,0))" ;;
+      last_accessed_at)
+        setlist="$setlist, last_accessed_at = nullif(max(coalesce(insights.last_accessed_at,''), coalesce(excluded.last_accessed_at,'')), '')" ;;
+      *)
+        setlist="$setlist, $c=excluded.$c" ;;
+    esac
   done
   collist="${collist#, }"; setlist="${setlist#, }"
+
+  # Second pass: usage max-merge for rows where the peer is NOT content-newer
+  # (the upsert's WHERE skips those entirely). Correlated subqueries keep it
+  # portable to older sqlite3 builds (no UPDATE..FROM).
+  local usage_sets="" usage_sql=""
+  if has_col "$ins_cols" access_count; then
+    usage_sets="$usage_sets, access_count = max(coalesce(access_count,0), coalesce((SELECT p.access_count FROM peer.insights p WHERE p.id = insights.id), 0))"
+  fi
+  if has_col "$ins_cols" last_accessed_at; then
+    usage_sets="$usage_sets, last_accessed_at = nullif(max(coalesce(last_accessed_at,''), coalesce((SELECT p.last_accessed_at FROM peer.insights p WHERE p.id = insights.id), '')), '')"
+  fi
+  if [ -n "$usage_sets" ]; then
+    usage_sql="UPDATE insights SET ${usage_sets#, } WHERE id IN (SELECT id FROM peer.insights);"
+  fi
 
   edge_cols="$(common_cols "$(db_cols "$live" edges)" "$(db_cols "$peer" edges)")"
   if has_col "$edge_cols" source_id && has_col "$edge_cols" target_id && has_col "$edge_cols" edge_type; then
@@ -86,6 +111,8 @@ INSERT INTO insights (${collist})
   SELECT ${collist} FROM peer.insights WHERE true
   ON CONFLICT(id) DO UPDATE SET ${setlist}
   WHERE excluded.updated_at > insights.updated_at;
+-- 1b) usage fields (access_count / last_accessed_at): max-merge for all peer rows
+${usage_sql}
 -- 2) edges: union (endpoints guaranteed to exist after step 1)
 ${edges_sql}
 -- 3) drop edges touching soft-deleted insights (mirrors mnemon's own forget())
