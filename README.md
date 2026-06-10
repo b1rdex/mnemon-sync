@@ -1,5 +1,7 @@
 # mnemon-sync
 
+[![CI](https://github.com/b1rdex/mnemon-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/b1rdex/mnemon-sync/actions/workflows/ci.yml)
+
 Sync your [mnemon](https://github.com/mnemon-dev/mnemon) memory stores across
 multiple machines — with **zero changes to mnemon's code**. Just the `sqlite3`
 CLI, [Syncthing](https://syncthing.net/), and Claude Code hooks.
@@ -27,7 +29,10 @@ instead:
    never two writers on one file — Syncthing never makes a conflict file.
 3. **Merge** — each machine imports peers' snapshots into its live DB with a
    **last-writer-wins** merge on the `insights` table (keyed by `updated_at`),
-   unions the edges, and drops edges of deleted insights.
+   merges the usage fields (`access_count`, `last_accessed_at`) by **max** so
+   recall activity travels too, unions the edges, and drops edges of deleted
+   insights. Merge columns are derived from the live schemas at merge time, so
+   devices on different mnemon versions still sync their common columns.
 
 This is a state-based CRDT that converges: new memories and deletions are never
 lost; a concurrent edit of the *same* memory resolves to the latest one.
@@ -94,6 +99,17 @@ Environment overrides: `MNEMON_DATA_DIR`, `MNEMON_SYNC_DIR`, `MNEMON_SYNC_HOST`
 
 Full rationale and trade-offs: **[DESIGN.md](DESIGN.md)**.
 
+## Development
+
+```bash
+make lint   # bash -n + shellcheck
+make test   # run the test harness
+```
+
+CI runs the same on every push: lint, plus the harness on Linux and macOS against
+a store created by the **real upstream mnemon binary** (`go install …@latest`) —
+a weekly run re-checks against the latest mnemon release to catch schema drift.
+
 ## Limitations (by design)
 
 - Graph **edges are unioned**, not recomputed (recall still works; a few edge
@@ -101,6 +117,9 @@ Full rationale and trade-offs: **[DESIGN.md](DESIGN.md)**.
 - Soft-delete **tombstones accumulate** over time.
 - A concurrent edit of the *same* insight on two machines resolves by
   last-writer-wins (the older revision of that one insight is dropped).
+- **Usage counters converge to max, not sum**: if both machines recall the same
+  insight before syncing, the merged `access_count` is the larger of the two,
+  not the total. The usage signal is never lost, but it can undercount.
 
 ## License
 

@@ -23,7 +23,7 @@ works with a stock, upstream mnemon install — nothing to patch or rebuild.
 | Decision | Choice | Rationale |
 |---|---|---|
 | What to sync | Per-device binary `.db` snapshot (not the live DB, not JSONL) | SQLite does the merge via `ATTACH`; embeddings ride along in columns for free; least code |
-| Conflict model | State-based **LWW** on the `insights` table, keyed by `updated_at` | mnemon's model fits exactly: UUID PKs (no insert collisions), soft-delete tombstones (`gc` never hard-deletes, `forget` only sets `deleted_at`), `updated_at` present on every row. Simplest converging CRDT. |
+| Conflict model | State-based **LWW** on the `insights` table, keyed by `updated_at`; usage fields (`access_count`, `last_accessed_at`) merge by **max** instead | mnemon's model fits exactly: UUID PKs (no insert collisions), soft-delete tombstones (`gc` never hard-deletes, `forget` only sets `deleted_at`), `updated_at` present on every row. Recall bumps usage *without* touching `updated_at` (mtime/atime split), so those two fields need their own monotone merge — see §4. |
 | Same-insight concurrent edit | Pure LWW (later `updated_at` wins; older revision dropped) | New insights and deletes are never lost; editing the *same* insight on both machines within a sync window is rare for personal memory |
 | Edges & embeddings | Edges = **union** (`INSERT OR IGNORE`); embeddings travel inside the insight row | Edges are a derived index; a union is a harmless superset. No engine re-run needed (that would require Go). There is no `reindex` CLI command. |
 | Sync scope | A **dedicated `~/.mnemon/sync/` folder** (allowlist) | Live `data/` stays *outside* the shared folder, so it physically cannot leak. Syncthing's `.stignore` is **per-device and not synced**, so a denylist over the whole `~/.mnemon` is a footgun (a fresh/misconfigured device with no ignore file would sync the live DBs everywhere). |
@@ -82,33 +82,38 @@ two-writer file and never produces a conflict file.
 - for each peer snapshot `*.db` **except** the local `<host>.db`, run the merge
   SQL below against the live DB.
 
-Merge SQL (run once per peer snapshot):
+Merge SQL (generated per peer snapshot — the column lists are **derived at merge
+time** by intersecting `pragma_table_info` of both databases, so devices running
+different mnemon versions sync their common columns and table defaults fill the
+rest; `id` and `updated_at` are required, otherwise the peer file is skipped):
 
 ```sql
 PRAGMA busy_timeout=5000;          -- wait, don't fail, if mnemon is mid-write
 ATTACH '<peer>.db' AS peer;
 BEGIN;
 
--- 1) insights: pure LWW by updated_at. Columns listed EXPLICITLY (not SELECT *)
---    as a guard against schema drift between mnemon versions on the two machines.
-INSERT INTO insights (id, content, category, importance, tags, entities, source,
-                      access_count, created_at, updated_at, deleted_at,
-                      last_accessed_at, embedding, effective_importance)
-  SELECT id, content, category, importance, tags, entities, source,
-         access_count, created_at, updated_at, deleted_at,
-         last_accessed_at, embedding, effective_importance
-  FROM peer.insights WHERE true
+-- 1) insights: LWW by updated_at over the COMMON columns. Two exceptions:
+--    access_count and last_accessed_at are merged with max() even here, so a
+--    content win never clobbers a higher usage signal from the other device.
+INSERT INTO insights (<common columns>)
+  SELECT <common columns> FROM peer.insights WHERE true
   ON CONFLICT(id) DO UPDATE SET
-    content=excluded.content, category=excluded.category,
-    importance=excluded.importance, tags=excluded.tags, entities=excluded.entities,
-    source=excluded.source, access_count=excluded.access_count,
-    created_at=excluded.created_at, updated_at=excluded.updated_at,
-    deleted_at=excluded.deleted_at, last_accessed_at=excluded.last_accessed_at,
-    embedding=excluded.embedding, effective_importance=excluded.effective_importance
+    <col>=excluded.<col> ...,
+    access_count     = max(coalesce(insights.access_count,0), coalesce(excluded.access_count,0)),
+    last_accessed_at = nullif(max(coalesce(insights.last_accessed_at,''), coalesce(excluded.last_accessed_at,'')), '')
   WHERE excluded.updated_at > insights.updated_at;
 
--- 2) edges: union. Endpoints are guaranteed to exist after step 1.
-INSERT OR IGNORE INTO edges SELECT * FROM peer.edges;
+-- 1b) usage fields for rows the upsert skipped (peer not content-newer):
+--     recall bumps access_count/last_accessed_at WITHOUT touching updated_at,
+--     so they need their own monotone merge. Correlated subqueries keep this
+--     portable to older sqlite3 builds (no UPDATE..FROM).
+UPDATE insights SET
+  access_count     = max(coalesce(access_count,0), coalesce((SELECT p.access_count FROM peer.insights p WHERE p.id = insights.id), 0)),
+  last_accessed_at = nullif(max(coalesce(last_accessed_at,''), coalesce((SELECT p.last_accessed_at FROM peer.insights p WHERE p.id = insights.id), '')), '')
+WHERE id IN (SELECT id FROM peer.insights);
+
+-- 2) edges: union over the common edge columns. Endpoints exist after step 1.
+INSERT OR IGNORE INTO edges (<common columns>) SELECT <common columns> FROM peer.edges;
 
 -- 3) tidy: drop edges touching soft-deleted insights (mirrors mnemon's own
 --    forget(), which removes a deleted node's edges).
@@ -121,9 +126,20 @@ DETACH peer;
 
 Ordering correctness: insights are merged before edges so every edge endpoint
 exists locally. `WHERE true` is the SQLite idiom that lets an upsert follow a
-`SELECT`. `updated_at` is stored as RFC3339 UTC text, so a lexical `>` comparison
-is also chronological — this is an assumption the design relies on (it holds as
-long as mnemon keeps the RFC3339 format).
+`SELECT`. `updated_at` and `last_accessed_at` are stored as RFC3339 UTC text, so
+lexical comparisons (`>`, `max()`) are also chronological — an assumption the
+design relies on (it holds as long as mnemon keeps the RFC3339 format).
+
+Why usage fields get special treatment: mnemon deliberately splits "when was the
+fact edited" (`updated_at`) from "when was it read" (`last_accessed_at` +
+`access_count`) — recall bumps only the latter pair. Under plain row-LWW those
+bumps neither propagate (row not "newer") nor survive a content win (all columns
+overwritten). Yet they feed retention: `IsImmune` (access ≥ 3), `gc` candidate
+selection, and the automatic `AutoPrune` at >1000 insights — so a device that
+never saw the bumps could prune a memory that is hot on the other device, and the
+tombstone would then sync everywhere. Max-merge makes the usage signal travel.
+A `max(updated_at, last_accessed_at)` LWW key was considered and rejected: a
+recall of a *stale* copy would then beat a genuine edit (or resurrect a forget).
 
 **`install-hooks`** — a `python3` routine that idempotently edits
 `~/.claude/settings.json`:
@@ -164,9 +180,13 @@ avoids that.
   occasionally weights aren't perfectly recomputed. Perfect recompute would need
   mnemon's engine (Go) — out of scope.
 - **Concurrent same-insight edit → LWW.** The older revision of that one insight is
-  dropped. New insights and deletes are never lost. Soft retention counters
-  (`access_count`, `effective_importance`) follow the LWW winner rather than
-  merging — acceptable, they are hints.
+  dropped. New insights and deletes are never lost.
+- **Usage counters merge by max, not sum.** Concurrent recall bumps on both
+  devices converge to the larger counter (4 and 3 from a common 2 → 4, true total
+  5). The "this memory is used" signal is never lost, but counts can undercount;
+  a per-device G-counter would fix that and is not worth the complexity here.
+  `effective_importance` still follows the LWW winner — it is derived and must be
+  able to decay, and mnemon recomputes it locally.
 - **Cross-device duplicates.** If the "same" fact is independently `remember`ed on
   both machines it gets different UUIDs → two rows survive the merge (no loss,
   possible duplication). mnemon's write-time dedup only sees the local DB;
