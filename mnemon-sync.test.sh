@@ -135,6 +135,26 @@ runB import
 [ "$(sqlite3 "$B/data/work/mnemon.db" "SELECT count(*) FROM insights WHERE id='W1';")" = 1 ] || fail "bootstrap: W1 missing on desktop"
 ok "new store 'work' bootstrapped onto desktop with its data"
 
+echo "== assert schema drift tolerance: devices on different mnemon versions still merge =="
+SHARED2="$ROOT/shared-drift"; D="$ROOT/devD"; E="$ROOT/devE"
+mkdir -p "$SHARED2" "$D/data/default" "$E/data/default"
+# devD: an OLDER mnemon schema — insights table without effective_importance
+sqlite3 "$D/data/default/mnemon.db" "
+CREATE TABLE insights (id TEXT PRIMARY KEY, content TEXT NOT NULL, category TEXT DEFAULT 'general', importance INTEGER DEFAULT 3, tags TEXT DEFAULT '[]', entities TEXT DEFAULT '[]', source TEXT DEFAULT 'user', access_count INTEGER DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, last_accessed_at TEXT, embedding BLOB);
+CREATE TABLE edges (source_id TEXT NOT NULL, target_id TEXT NOT NULL, edge_type TEXT NOT NULL, weight REAL DEFAULT 1.0, metadata TEXT DEFAULT '{}', created_at TEXT NOT NULL, PRIMARY KEY (source_id, target_id, edge_type));"
+# devE: full current schema (from the seed)
+cp "$SEED" "$E/data/default/mnemon.db"
+ins "$E/data/default/mnemon.db" "EE-full" "from full-schema device" "$T1"
+sqlite3 "$D/data/default/mnemon.db" "INSERT INTO insights (id,content,category,importance,tags,entities,source,access_count,created_at,updated_at) VALUES ('DD-old','from old-schema device','fact',3,'[]','[]','test',0,'$T1','$T1');"
+runD() { MNEMON_DATA_DIR="$D" MNEMON_SYNC_DIR="$SHARED2" MNEMON_SYNC_HOST="oldbox" "$SCRIPT" "$@" >/dev/null 2>&1; }
+runE() { MNEMON_DATA_DIR="$E" MNEMON_SYNC_DIR="$SHARED2" MNEMON_SYNC_HOST="newbox" "$SCRIPT" "$@" >/dev/null 2>&1; }
+runD export; runE export
+runD import; runE import
+[ "$(sqlite3 "$D/data/default/mnemon.db" "SELECT count(*) FROM insights WHERE id='EE-full';")" = 1 ] || fail "drift: EE-full did not reach the old-schema device"
+[ "$(sqlite3 "$E/data/default/mnemon.db" "SELECT count(*) FROM insights WHERE id='DD-old';")" = 1 ] || fail "drift: DD-old did not reach the full-schema device"
+[ "$(sqlite3 "$E/data/default/mnemon.db" "SELECT effective_importance FROM insights WHERE id='DD-old';")" = "0.5" ] || fail "drift: missing column did not get its default on the full-schema device"
+ok "rows sync across devices with different column sets (common columns merged, defaults fill the rest)"
+
 echo "== assert install-hooks idempotency + non-destructiveness =="
 ST="$ROOT/settings.json"
 cat > "$ST" <<JSON
